@@ -1,0 +1,107 @@
+﻿name: build-angle-android-x64
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: cache checkout
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/angle
+            ~/.cipd
+            ~/depot_tools
+          key: angle-src-v2
+
+      - name: depot_tools
+        run: |
+          if [ ! -d $HOME/depot_tools ]; then git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $HOME/depot_tools; fi
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
+
+      - name: fetch ANGLE
+        run: |
+          mkdir -p $HOME/angle && cd $HOME/angle
+          if [ ! -f .gclient ]; then gclient config --name src --custom-var=checkout_android=True https://chromium.googlesource.com/angle/angle; fi
+          gclient sync
+
+      - name: patch swiftshader headers
+        run: |
+          H=$(find $HOME/angle/src/third_party -name 'vk_android_native_buffer.h' 2>/dev/null | head -1)
+          echo "found header: $H"
+          mkdir -p $HOME/angle/src/third_party/SwiftShader/include/vulkan
+          if [ -n "$H" ]; then cp -v "$H" $HOME/angle/src/third_party/SwiftShader/include/vulkan/; fi
+          ls -l $HOME/angle/src/third_party/SwiftShader/include/vulkan/
+
+      - name: NDK
+        run: |
+          if [ ! -d $HOME/android-ndk-r27c ]; then
+            curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+            unzip -q /tmp/ndk.zip -d $HOME
+          fi
+          ls -d $HOME/android-ndk-r27c
+
+      - name: gn gen
+        run: |
+          cd $HOME/angle/src
+          gn gen $HOME/out/Rel --args="target_os=\"android\" target_cpu=\"x64\" is_debug=false is_component_build=false angle_enable_vulkan=true angle_enable_swiftshader=true android_ndk_path=\"$HOME/android-ndk-r27c\""
+
+      - name: autoninja angle
+        run: |
+          cd $HOME/angle/src
+          set +e
+          autoninja -C $HOME/out/Rel libEGL_angle.so libGLESv2_angle.so libGLESv1_CM_angle.so 2>&1 | tee $HOME/ninja-angle.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC"
+          exit $RC
+
+      - name: autoninja swiftshader
+        run: |
+          cd $HOME/angle/src
+          set +e
+          autoninja -C $HOME/out/Rel libvk_swiftshader.so 2>&1 | tee $HOME/ninja-swift.log
+          RC=${PIPESTATUS[0]}
+          echo "rc=$RC"
+          exit $RC
+
+      - name: collect
+        run: |
+          mkdir -p artifact
+          find $HOME/out/Rel -name 'libEGL_angle.so' -o -name 'libGLESv2_angle.so' -o -name 'libGLESv1_CM_angle.so' -o -name 'libvk_swiftshader.so' | xargs -r -I{} cp -v {} artifact/
+          find $HOME/out/Rel -name '*.so' > artifact/so-listing.txt
+          ls -l artifact
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-android-x64
+          path: artifact/*
+
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          files: artifact/*
+
+      - name: commit error log via api
+        if: failure()
+        run: |
+          {
+            echo "== ninja angle tail =="
+            tail -80 $HOME/ninja-angle.log 2>/dev/null || echo "no angle log"
+            echo "== ninja swift tail =="
+            tail -80 $HOME/ninja-swift.log 2>/dev/null || echo "no swift log"
+          } > /tmp/err.txt
+          wc -c /tmp/err.txt
+          B64=$(base64 -w0 /tmp/err.txt)
+          curl -sS -X PUT \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"message\":\"error log run ${{ github.run_number }}\",\"content\":\"$B64\",\"branch\":\"main\"}" \
+            https://api.github.com/repos/${{ github.repository }}/contents/errors/run-${{ github.run_number }}.txt
